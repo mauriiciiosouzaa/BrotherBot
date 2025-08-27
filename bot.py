@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlsplit, unquote
 
 from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters, AIORateLimiter
+from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from telegram.error import TimedOut, RetryAfter, NetworkError
 from telegram.request import HTTPXRequest
 
@@ -39,6 +39,7 @@ def replace_corner(text: str) -> str:
     return CORNER_RE.sub(PROMO_MSG, text)
 
 async def safe_send(bot, **kwargs):
+    # retentativas com backoff + respeito ao RetryAfter do Telegram
     for attempt in range(5):
         try:
             return await bot.send_message(**kwargs)
@@ -54,21 +55,21 @@ async def safe_send(bot, **kwargs):
 
 async def forward_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not user or not update.effective_message or not update.effective_message.text:
+    msg = update.effective_message
+    if not user or not msg or not msg.text:
         return
     if ALLOWED_USERNAME and (user.username or "").lower() != ALLOWED_USERNAME:
         return
-    text = replace_corner(update.effective_message.text)
+    text = replace_corner(msg.text)
     try:
         await safe_send(context.bot, chat_id=CHANNEL_ID, text=text)
     except Exception:
         log.exception("Falha ao enviar para o canal")
 
-# --------- Healthcheck (GET/HEAD) ----------
+# --------- Healthcheck (HEAD/GET suportados) ----------
 class HealthHandler(BaseHTTPRequestHandler):
     def _is_ok_path(self) -> bool:
-        raw_path = urlsplit(self.path).path
-        path = unquote(raw_path).lower()
+        path = unquote(urlsplit(self.path).path).lower()
         return path in ("/", "/health", "/saude", "/saúde")
 
     def _send_ok_headers(self) -> bytes:
@@ -107,14 +108,13 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     threading.Thread(target=start_health_server, args=(port,), daemon=True).start()
 
-    # Request padrão (sem timeout custom, compatível com PTB 22.3)
+    # Request padrão compatível com PTB 22.3
     request = HTTPXRequest()
 
     application = (
         Application.builder()
         .token(TOKEN)
         .request(request)
-        .rate_limiter(AIORateLimiter())
         .build()
     )
 
