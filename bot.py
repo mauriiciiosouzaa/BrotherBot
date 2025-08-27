@@ -6,6 +6,7 @@ import logging
 import threading
 import asyncio
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlsplit, unquote
 
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters, AIORateLimiter
@@ -40,7 +41,6 @@ def replace_corner(text: str) -> str:
 
 async def safe_send(bot, **kwargs):
     """Envio com retentativas e respeito a rate limit."""
-    # 5 tentativas com backoff exponencial
     for attempt in range(5):
         try:
             return await bot.send_message(**kwargs)
@@ -69,17 +69,41 @@ async def forward_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # --------- Healthcheck em thread separada ----------
 class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ("/", "/health"):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"OK")
+    def _is_ok_path(self) -> bool:
+        # Normaliza o path (suporta /, /health, /saude e /saúde)
+        raw_path = urlsplit(self.path).path
+        path = unquote(raw_path).lower()
+        return path in ("/", "/health", "/saude", "/saúde")
+
+    def _send_ok_headers(self) -> bytes:
+        body = b"OK"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))  # importante para HEAD
+        self.end_headers()
+        return body
+
+    def do_HEAD(self):
+        if self._is_ok_path():
+            # Para HEAD, só envia cabeçalhos (sem body)
+            self._send_ok_headers()
         else:
             self.send_response(404)
             self.end_headers()
+
+    def do_GET(self):
+        if self._is_ok_path():
+            body = self._send_ok_headers()
+            try:
+                self.wfile.write(body)
+            except BrokenPipeError:
+                pass
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def log_message(self, *args, **kwargs):
-        return
+        return  # silencia logs do HTTP server
 
 def start_health_server(port: int):
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
@@ -98,7 +122,7 @@ if __name__ == "__main__":
         Application.builder()
         .token(TOKEN)
         .request(request)
-        .rate_limiter(AIORateLimiter())  # respeita limites globais por padrão
+        .rate_limiter(AIORateLimiter())
         .build()
     )
 
