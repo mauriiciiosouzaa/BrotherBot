@@ -1,17 +1,11 @@
 # bot.py
-import os
-import re
-import sys
-import logging
-import threading
-import asyncio
+import os, re, sys, logging, threading, asyncio
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlsplit, unquote
 
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
-from telegram.error import TimedOut, RetryAfter, NetworkError
-from telegram.request import HTTPXRequest
+from telegram.error import TimedOut, RetryAfter, NetworkError, Conflict
+import httpx
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 log = logging.getLogger(__name__)
@@ -39,7 +33,7 @@ def replace_corner(text: str) -> str:
     return CORNER_RE.sub(PROMO_MSG, text)
 
 async def safe_send(bot, **kwargs):
-    # retentativas com backoff + respeito ao RetryAfter do Telegram
+    """Envio com retentativas e respeito a rate limit."""
     for attempt in range(5):
         try:
             return await bot.send_message(**kwargs)
@@ -47,11 +41,13 @@ async def safe_send(bot, **kwargs):
             wait = int(getattr(e, "retry_after", 5)) or 5
             log.warning("Flood control, aguardando %ss ...", wait)
             await asyncio.sleep(wait)
-        except (TimedOut, NetworkError) as e:
+        except (TimedOut, NetworkError):
             wait = min(2 ** attempt, 10)
-            log.warning("Timeout/rede (%s). Tentando novamente em %ss ...", type(e).__name__, wait)
+            log.warning("Timeout/rede. Tentando novamente em %ss ...", wait)
             await asyncio.sleep(wait)
-    log.error("Desisti de enviar após várias tentativas.")
+        except Exception:
+            log.exception("Falha ao enviar mensagem (tentativa %s)", attempt + 1)
+            await asyncio.sleep(1)
 
 async def forward_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -60,42 +56,24 @@ async def forward_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if ALLOWED_USERNAME and (user.username or "").lower() != ALLOWED_USERNAME:
         return
+
     text = replace_corner(msg.text)
     try:
         await safe_send(context.bot, chat_id=CHANNEL_ID, text=text)
     except Exception:
         log.exception("Falha ao enviar para o canal")
 
-# --------- Healthcheck (HEAD/GET suportados) ----------
+# --------- Healthcheck em thread separada ----------
 class HealthHandler(BaseHTTPRequestHandler):
-    def _is_ok_path(self) -> bool:
-        path = unquote(urlsplit(self.path).path).lower()
-        return path in ("/", "/health", "/saude", "/saúde")
-
-    def _send_ok_headers(self) -> bytes:
-        body = b"OK"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        return body
-
-    def do_HEAD(self):
-        if self._is_ok_path():
-            self._send_ok_headers()
-        else:
-            self.send_response(404); self.end_headers()
-
     def do_GET(self):
-        if self._is_ok_path():
-            body = self._send_ok_headers()
-            try:
-                self.wfile.write(body)
-            except BrokenPipeError:
-                pass
+        if self.path in ("/", "/health"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK")
         else:
-            self.send_response(404); self.end_headers()
-
+            self.send_response(404)
+            self.end_headers()
     def log_message(self, *args, **kwargs):
         return
 
@@ -104,21 +82,27 @@ def start_health_server(port: int):
     log.info("HTTP health em 0.0.0.0:%s", port)
     server.serve_forever()
 
+# ---------- Tratador global de erros ----------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    if isinstance(err, Conflict):
+        # Outra instância está com getUpdates ativo. Espera e segue tentando.
+        log.warning("409 Conflict: outra instância usando o mesmo token. Aguardando 30s…")
+        await asyncio.sleep(30)
+        return
+    log.exception("Erro não tratado no handler: %r", err)
+
 if __name__ == "__main__":
+    # Healthcheck
     port = int(os.getenv("PORT", "10000"))
     threading.Thread(target=start_health_server, args=(port,), daemon=True).start()
 
-    # Request padrão compatível com PTB 22.3
-    request = HTTPXRequest()
-
-    application = (
-        Application.builder()
-        .token(TOKEN)
-        .request(request)
-        .build()
-    )
+    # Constrói o app (usa defaults do PTB; sem AIORateLimiter p/ evitar dependência extra)
+    application = Application.builder().token(TOKEN).build()
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, forward_text))
+    application.add_error_handler(on_error)
 
     log.info("Bot rodando (long polling).")
-    application.run_polling(close_loop=True)
+    # Evita reprocessar backlog antigo após reinícios → reduz risco de flood/429
+    application.run_polling(drop_pending_updates=True, close_loop=True)
