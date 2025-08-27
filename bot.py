@@ -4,17 +4,15 @@ import re
 import sys
 import logging
 import threading
+import asyncio
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
-from telegram.ext import (
-    Application,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, ContextTypes, MessageHandler, filters, AIORateLimiter
+from telegram.error import TimedOut, RetryAfter, NetworkError
+from telegram.request import HTTPXRequest
+import httpx
 
-# ---------- Config & validação ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 log = logging.getLogger(__name__)
 
@@ -29,41 +27,47 @@ if not TOKEN or not CHANNEL_ID_STR:
 try:
     CHANNEL_ID = int(CHANNEL_ID_STR)
 except ValueError:
-    log.error("CHANNEL_ID inválido: use o ID numérico do canal (ex.: -1002234...).")
+    log.error("CHANNEL_ID inválido (use o ID numérico, ex.: -100223...).")
     sys.exit(1)
 
 log.info("Config: canal=%s, allowed_username=%s", CHANNEL_ID, ALLOWED_USERNAME or "(nenhum)")
 
-# Mensagem personalizada para substituir o link da CornerPro
 PROMO_MSG = 'Entrem no nosso outro canal grátis! 📲 https://t.me/BrotherDosGreens'
-# Pega variações com http/https e possíveis barras finais
 CORNER_RE = re.compile(r"https?://(?:www\.)?cornerprobet\.com/?", flags=re.IGNORECASE)
 
 def replace_corner(text: str) -> str:
     return CORNER_RE.sub(PROMO_MSG, text)
 
-# ---------- Handlers ----------
+async def safe_send(bot, **kwargs):
+    """Envio com retentativas e respeito a rate limit."""
+    # 5 tentativas com backoff exponencial
+    for attempt in range(5):
+        try:
+            return await bot.send_message(**kwargs)
+        except RetryAfter as e:
+            wait = int(getattr(e, "retry_after", 5)) or 5
+            log.warning("Flood control, aguardando %ss ...", wait)
+            await asyncio.sleep(wait)
+        except (TimedOut, NetworkError) as e:
+            wait = min(2 ** attempt, 10)
+            log.warning("Timeout/rede (%s). Tentando novamente em %ss ...", type(e).__name__, wait)
+            await asyncio.sleep(wait)
+    log.error("Desisti de enviar após várias tentativas.")
+
 async def forward_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not user:
+    if not user or not update.effective_message or not update.effective_message.text:
         return
-
-    # Permite APENAS o usuário definido em ALLOWED_USERNAME
     if ALLOWED_USERNAME and (user.username or "").lower() != ALLOWED_USERNAME:
         return
 
-    if not update.effective_message or not update.effective_message.text:
-        return
-
-    text = update.effective_message.text
-    text = replace_corner(text)
-
+    text = replace_corner(update.effective_message.text)
     try:
-        await context.bot.send_message(chat_id=CHANNEL_ID, text=text)
-    except Exception as e:
-        log.exception("Falha ao enviar para o canal: %s", e)
+        await safe_send(context.bot, chat_id=CHANNEL_ID, text=text)
+    except Exception:
+        log.exception("Falha ao enviar para o canal")
 
-# ---------- Healthcheck em thread separada ----------
+# --------- Healthcheck em thread separada ----------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/health"):
@@ -74,9 +78,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
-
-    # Evita log barulhento no console
-    def log_message(self, format, *args):
+    def log_message(self, *args, **kwargs):
         return
 
 def start_health_server(port: int):
@@ -84,16 +86,23 @@ def start_health_server(port: int):
     log.info("HTTP health em 0.0.0.0:%s", port)
     server.serve_forever()
 
-# ---------- Main ----------
 if __name__ == "__main__":
-    # Sobe o healthcheck numa thread daemon
+    # Healthcheck
     port = int(os.getenv("PORT", "10000"))
     threading.Thread(target=start_health_server, args=(port,), daemon=True).start()
 
-    # Telegram bot
-    application = Application.builder().token(TOKEN).build()
+    # Aumenta timeouts de rede do PTB
+    request = HTTPXRequest(timeout=httpx.Timeout(30.0, connect=10.0, read=30.0))
+    # Rate limiter automático do PTB
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .request(request)
+        .rate_limiter(AIORateLimiter())  # respeita limites globais por padrão
+        .build()
+    )
+
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, forward_text))
 
     log.info("Bot rodando (long polling).")
-    # NÃO usar asyncio.run aqui; deixar o PTB controlar o loop
     application.run_polling(close_loop=True)
