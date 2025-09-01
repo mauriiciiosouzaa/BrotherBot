@@ -45,6 +45,11 @@ def start_health_server(port: int):
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
+
+# >>> NOVO: origem por ID (prioritário) e DEBUG opcional <<<
+ORIGEM_CHAT_ID = int(os.getenv("ORIGEM_CHAT_ID", "0"))  # ex.: 779230055 (DM @cornerpro2_bot) ou -100... (canal/grupo)
+DEBUG = os.getenv("DEBUG", "0") == "1"
+
 SOURCE_BOT = os.getenv("ORIGEM_USERNAME", "") or ""
 TARGET_CHAT_ID = int(os.getenv("DESTINO_CHAT_ID", "0"))
 MODE = os.getenv("MODE", "copy").strip().lower()   # forward ou copy
@@ -216,26 +221,37 @@ async def _process_event(event):
         logging.exception(f"Erro ao enviar: {e}")
 
 # ==============================
-# Filtro de origem
+# Filtro de origem (PRIORIDADE: ID do chat)
 # ==============================
 async def _is_from_source(event) -> bool:
+    # 1) Preferir ID do chat (mais robusto; cobre DM/canal/grupo)
+    try:
+        if ORIGEM_CHAT_ID and event.chat_id == ORIGEM_CHAT_ID:
+            if DEBUG:
+                logging.info(f"[DEBUG] match por ID da origem: {event.chat_id}")
+            return True
+    except Exception:
+        pass
+
+    # 2) Fallback por username (caso ainda use ORIGEM_USERNAME)
+    sender_user = ""
+    chat_user = ""
     try:
         sender = await event.get_sender()
         sender_user = (getattr(sender, "username", "") or "").lower()
-        if sender_user == SOURCE_BOT:
-            return True
     except Exception:
         pass
 
     try:
         chat = await event.get_chat()
         chat_user = (getattr(chat, "username", "") or "").lower()
-        if chat_user == SOURCE_BOT:
-            return True
     except Exception:
         pass
 
-    return False
+    if DEBUG:
+        logging.info(f"[DEBUG] chat_id={getattr(event, 'chat_id', None)} sender={sender_user!r} chat={chat_user!r} want={SOURCE_BOT!r}")
+
+    return (SOURCE_BOT and (sender_user == SOURCE_BOT or chat_user == SOURCE_BOT))
 
 # ==============================
 # Handlers
