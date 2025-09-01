@@ -6,6 +6,7 @@ import time
 import logging
 import threading
 import asyncio
+import signal
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
@@ -62,7 +63,6 @@ async def safe_send(bot, **kwargs):
 async def forward_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     msg = update.effective_message
-
     if not user or not msg or not msg.text:
         return
 
@@ -92,7 +92,6 @@ class HealthHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         if self.path in ("/", "/health"):
-            # UptimeRobot no free usa HEAD; só cabeçalhos, sem corpo
             self._send_ok_headers()
         else:
             self.send_error(404)
@@ -107,13 +106,16 @@ def start_health_server(port: int):
 
 # --------- Boot ----------
 def build_app() -> Application:
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .build()
-    )
+    app = Application.builder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, forward_text))
     return app
+
+stop_flag = False
+
+def _handle_sigterm(signum, frame):
+    global stop_flag
+    stop_flag = True
+    log.info("Recebido SIGTERM: encerrando loop principal...")
 
 if __name__ == "__main__":
     # Inicia o healthcheck HTTP (GET/HEAD) para UptimeRobot/Render
@@ -123,12 +125,15 @@ if __name__ == "__main__":
     # Constrói a aplicação do Telegram
     application = build_app()
 
+    # Captura SIGTERM (Render/Railway) para encerrar limpo
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     # Tenta rodar continuamente; se aparecer 409 (outra instância), aguarda e tenta de novo
-    while True:
+    while not stop_flag:
         log.info("Bot rodando (long polling).")
         try:
             application.run_polling(drop_pending_updates=True, close_loop=True)
-        except Conflict as e:
+        except Conflict:
             log.warning("409 Conflict (outra instância usando o mesmo token). Aguardando 30s…")
             time.sleep(30)
             continue
@@ -139,3 +144,5 @@ if __name__ == "__main__":
             log.exception("Erro inesperado no run_polling. Reiniciando em 10s …")
             time.sleep(10)
             continue
+
+    log.info("Loop principal encerrado.")
