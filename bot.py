@@ -1,148 +1,271 @@
-# bot.py
+# forwarder.py
 import os
 import re
-import sys
-import time
-import logging
-import threading
 import asyncio
-import signal
+import logging
+from dotenv import load_dotenv
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError
+
+# (A) --- IMPORTS do health server (NOVO) ---
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+# -------------------------------------------
 
-from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
-from telegram.error import TimedOut, RetryAfter, NetworkError, Conflict, InvalidToken
+# ==============================
+# Carregar variáveis do .env
+# ==============================
+load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
-log = logging.getLogger(__name__)
-
-# --------- Config (via variáveis de ambiente) ----------
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID_STR = os.getenv("CHANNEL_ID", "").strip()
-ALLOWED_USERNAME = os.getenv("ALLOWED_USERNAME", "").lstrip("@").strip().lower()
-
-if not TOKEN or not CHANNEL_ID_STR:
-    log.error("Faltam variáveis: BOT_TOKEN e/ou CHANNEL_ID.")
-    sys.exit(1)
-
-try:
-    CHANNEL_ID = int(CHANNEL_ID_STR)
-except ValueError:
-    log.error("CHANNEL_ID inválido (use o ID numérico, ex.: -100223...).")
-    sys.exit(1)
-
-log.info("Config: canal=%s, allowed_username=%s", CHANNEL_ID, ALLOWED_USERNAME or "(nenhum)")
-
-# --------- Regras de conteúdo ----------
-PROMO_MSG = 'Entrem no nosso outro canal grátis! 📲 https://t.me/BrotherDosGreens'
-CORNER_RE = re.compile(r"https?://(?:www\.)?cornerprobet\.com/?", flags=re.IGNORECASE)
-
-def replace_corner(text: str) -> str:
-    return CORNER_RE.sub(PROMO_MSG, text)
-
-# --------- Envio com retentativas ----------
-async def safe_send(bot, **kwargs):
-    """Envia mensagem com retentativas e respeito a flood control/timeouts."""
-    for attempt in range(5):
-        try:
-            return await bot.send_message(**kwargs)
-        except RetryAfter as e:
-            wait = int(getattr(e, "retry_after", 5)) or 5
-            log.warning("Flood control: aguardando %ss ...", wait)
-            await asyncio.sleep(wait)
-        except (TimedOut, NetworkError) as e:
-            wait = min(2 ** attempt, 10)
-            log.warning("Timeout/rede (%s). Tentando novamente em %ss ...", type(e).__name__, wait)
-            await asyncio.sleep(wait)
-        except Exception:
-            log.exception("Falha inesperada ao enviar. Tentando novamente ...")
-            await asyncio.sleep(2)
-    log.error("Desisti de enviar após várias tentativas.")
-
-# --------- Handler principal ----------
-async def forward_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    msg = update.effective_message
-    if not user or not msg or not msg.text:
-        return
-
-    # Encaminhar só do usuário permitido (se configurado)
-    if ALLOWED_USERNAME and (user.username or "").lower() != ALLOWED_USERNAME:
-        return
-
-    text = replace_corner(msg.text)
-    try:
-        await safe_send(context.bot, chat_id=CHANNEL_ID, text=text)
-    except Exception:
-        log.exception("Falha ao enviar para o canal")
-
-# --------- Healthcheck em thread separada ----------
+# (B) --- Healthcheck HTTP (NOVO) ---
 class HealthHandler(BaseHTTPRequestHandler):
-    def _send_ok_headers(self):
+    def _ok(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-
     def do_GET(self):
         if self.path in ("/", "/health"):
-            self._send_ok_headers()
+            self._ok()
             self.wfile.write(b"OK")
         else:
             self.send_error(404)
-
     def do_HEAD(self):
         if self.path in ("/", "/health"):
-            self._send_ok_headers()
+            self._ok()
         else:
             self.send_error(404)
-
     def log_message(self, *args, **kwargs):
         return
 
 def start_health_server(port: int):
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    log.info("HTTP health em 0.0.0.0:%s", port)
-    server.serve_forever()
+    logging.info(f"HTTP health em 0.0.0.0:{port}")
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+# ------------------------------------
 
-# --------- Boot ----------
-def build_app() -> Application:
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, forward_text))
-    return app
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+SOURCE_BOT = os.getenv("ORIGEM_USERNAME", "") or ""
+TARGET_CHAT_ID = int(os.getenv("DESTINO_CHAT_ID", "0"))
+MODE = os.getenv("MODE", "copy").strip().lower()   # forward ou copy
+STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
+REPLACE_FROM = (os.getenv("REPLACE_FROM", "") or "").strip()
+REPLACE_TO = (os.getenv("REPLACE_TO", "") or "").strip()
+NOTIFY_CHAT_ID = int(os.getenv("NOTIFY_CHAT_ID", "0"))  # <= NOVO
 
-stop_flag = False
+# Normalizar username (sem @)
+if SOURCE_BOT.startswith("@"):
+    SOURCE_BOT = SOURCE_BOT[1:]
+SOURCE_BOT = SOURCE_BOT.lower()
 
-def _handle_sigterm(signum, frame):
-    global stop_flag
-    stop_flag = True
-    log.info("Recebido SIGTERM: encerrando loop principal...")
+SESSION_NAME = "forwarder"
 
-if __name__ == "__main__":
-    # Inicia o healthcheck HTTP (GET/HEAD) para UptimeRobot/Render
+# ==============================
+# Logging
+# ==============================
+os.makedirs("logs", exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("logs/forwarder.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ],
+)
+
+# ==============================
+# Inicializar cliente
+# ==============================
+if STRING_SESSION:
+    client = TelegramClient(
+        StringSession(STRING_SESSION), API_ID, API_HASH,
+        device_model="CornerForward", system_version="Windows 11", app_version="1.40.0"
+    )
+else:
+    client = TelegramClient(
+        SESSION_NAME, API_ID, API_HASH,
+        device_model="CornerForward", system_version="Windows 11", app_version="1.40.0"
+    )
+
+# ==============================
+# Helpers de substituição
+# ==============================
+def _build_replace_patterns() -> list:
+    patterns = []
+    if not REPLACE_FROM:
+        return patterns
+
+    try:
+        patterns.append(re.compile(re.escape(REPLACE_FROM), flags=re.IGNORECASE))
+    except re.error:
+        pass
+
+    m = re.search(r'([a-z0-9.-]+\.[a-z]{2,})', REPLACE_FROM, re.I)
+    if m:
+        host = re.escape(m.group(1))
+        wide = re.compile(rf'(?:https?://)?(?:www\.)?{host}\S*', flags=re.IGNORECASE)
+        patterns.append(wide)
+
+    return patterns
+
+_REPLACE_PATTERNS = _build_replace_patterns()
+
+def replace_text(text: str) -> str:
+    if not text:
+        return ""
+    if not REPLACE_TO or not _REPLACE_PATTERNS:
+        return text
+
+    new_text = text
+    total_hits = 0
+    for pat in _REPLACE_PATTERNS:
+        new_text, hits = pat.subn(REPLACE_TO, new_text)
+        total_hits += hits
+
+    if total_hits > 0:
+        logging.info(f"Substituição aplicada ({total_hits} ocorrência(s)).")
+    else:
+        logging.info("Nenhuma ocorrência encontrada para substituição.")
+
+    return new_text
+
+# ==============================
+# Envio + notificação
+# ==============================
+async def _notify_if_configured(preview_text: str):
+    """Envia alerta pra você após publicar no canal, se NOTIFY_CHAT_ID estiver setado."""
+    if NOTIFY_CHAT_ID == 0:
+        return
+    try:
+        msg = f"✅ Encaminhado para {TARGET_CHAT_ID}\nPrévia: {preview_text[:200]}"
+        await client.send_message(NOTIFY_CHAT_ID, msg, silent=False, link_preview=False)
+    except Exception as e:
+        logging.warning(f"Falha ao notificar NOTIFY_CHAT_ID: {e}")
+
+# ==============================
+# Funções de cópia e forward
+# ==============================
+async def _copy_single_message(msg):
+    text = msg.message or ""
+    new_text = replace_text(text) or None
+
+    if msg.media:
+        await client.send_file(
+            TARGET_CHAT_ID,
+            msg.media,
+            caption=new_text,
+            force_document=False,
+            silent=False
+        )
+    else:
+        await client.send_message(
+            TARGET_CHAT_ID,
+            new_text or "",
+            link_preview=True,
+            silent=False
+        )
+
+async def _handle_copy(event):
+    if getattr(event, "messages", None):
+        files = []
+        caption = None
+        for m in event.messages:
+            if m.media:
+                files.append(m.media)
+            if not caption and (m.message or "").strip():
+                caption = replace_text(m.message)
+        if files:
+            await client.send_file(
+                TARGET_CHAT_ID,
+                files,
+                caption=caption or None,
+                silent=False
+            )
+        return
+    await _copy_single_message(event.message)
+
+async def _handle_forward(event):
+    if REPLACE_FROM:
+        logging.info("Substituição ativa: usando COPY em vez de FORWARD")
+        await _handle_copy(event)
+        return
+    await event.forward_to(TARGET_CHAT_ID)
+
+async def _process_event(event):
+    try:
+        effective_mode = MODE
+        if MODE == "forward" and REPLACE_FROM:
+            effective_mode = "copy"
+
+        if effective_mode == "copy":
+            await _handle_copy(event)
+        else:
+            await _handle_forward(event)
+
+        preview = (event.raw_text or "").replace("\n", " ")[:120]
+        logging.info(f"Enviado → {TARGET_CHAT_ID} | Mode={effective_mode} | Preview='{preview}'")
+
+        # ===== NOVO: notifica você após publicar =====
+        await _notify_if_configured(preview)
+
+    except FloodWaitError as fw:
+        wait = getattr(fw, "seconds", 5)
+        logging.warning(f"FloodWait: aguardando {wait}s")
+        await asyncio.sleep(wait + 1)
+    except Exception as e:
+        logging.exception(f"Erro ao enviar: {e}")
+
+# ==============================
+# Filtro de origem
+# ==============================
+async def _is_from_source(event) -> bool:
+    try:
+        sender = await event.get_sender()
+        sender_user = (getattr(sender, "username", "") or "").lower()
+        if sender_user == SOURCE_BOT:
+            return True
+    except Exception:
+        pass
+
+    try:
+        chat = await event.get_chat()
+        chat_user = (getattr(chat, "username", "") or "").lower()
+        if chat_user == SOURCE_BOT:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+# ==============================
+# Handlers
+# ==============================
+@client.on(events.NewMessage)
+async def on_new_message(event):
+    if not await _is_from_source(event):
+        return
+    await _process_event(event)
+
+if hasattr(events, "Album"):
+    @client.on(events.Album)
+    async def on_album(event):
+        if not await _is_from_source(event):
+            return
+        await _process_event(event)
+
+# ==============================
+# Main
+# ==============================
+def main():
+    logging.info("Forwarder rodando…")
+
+    # (C) --- Inicia o health server (NOVO) ---
     port = int(os.getenv("PORT", "10000"))
     threading.Thread(target=start_health_server, args=(port,), daemon=True).start()
+    # -----------------------------------------
 
-    # Constrói a aplicação do Telegram
-    application = build_app()
+    client.start()
+    client.run_until_disconnected()
 
-    # Captura SIGTERM (Render/Railway) para encerrar limpo
-    signal.signal(signal.SIGTERM, _handle_sigterm)
-
-    # Tenta rodar continuamente; se aparecer 409 (outra instância), aguarda e tenta de novo
-    while not stop_flag:
-        log.info("Bot rodando (long polling).")
-        try:
-            application.run_polling(drop_pending_updates=True, close_loop=True)
-        except Conflict:
-            log.warning("409 Conflict (outra instância usando o mesmo token). Aguardando 30s…")
-            time.sleep(30)
-            continue
-        except InvalidToken:
-            log.error("TOKEN inválido. Verifique a variável BOT_TOKEN no Render.")
-            sys.exit(1)
-        except Exception:
-            log.exception("Erro inesperado no run_polling. Reiniciando em 10s …")
-            time.sleep(10)
-            continue
-
-    log.info("Loop principal encerrado.")
+if __name__ == "__main__":
+    main()
