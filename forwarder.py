@@ -260,13 +260,32 @@ async def _is_from_source(event) -> bool:
 async def on_new_message(event):
     if not await _is_from_source(event):
         return
+
+    # 🔴 NOVO FILTRO: só processa se quem enviou for BOT
+    try:
+        sender = await event.get_sender()
+        if not getattr(sender, "bot", False):
+            return
+    except Exception:
+        return
+
     await _process_event(event)
+
 
 if hasattr(events, "Album"):
     @client.on(events.Album)
     async def on_album(event):
         if not await _is_from_source(event):
             return
+
+        # 🔴 NOVO FILTRO: só processa se quem enviou for BOT
+        try:
+            sender = await event.get_sender()
+            if not getattr(sender, "bot", False):
+                return
+        except Exception:
+            return
+
         await _process_event(event)
 
 # ==============================
