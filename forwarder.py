@@ -1,102 +1,172 @@
-# forwarder.py
 import os
 import re
 import asyncio
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
 
-# (A) --- IMPORTS do health server (NOVO) ---
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-# -------------------------------------------
-
 # ==============================
-# Carregar variáveis do .env
+# Carregar variáveis do ambiente
 # ==============================
 load_dotenv()
 
-# (B) --- Healthcheck HTTP (NOVO) ---
+
+# ==============================
+# Helpers de ambiente
+# ==============================
+def get_int_env(name: str, default: int = 0) -> int:
+    value = (os.getenv(name, "") or "").strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logging.warning(f"Variável {name} inválida: {value!r}. Usando {default}.")
+        return default
+
+
+def get_bool_env(name: str, default: bool = False) -> bool:
+    value = (os.getenv(name, "") or "").strip().lower()
+    if value in ("1", "true", "yes", "sim", "on"):
+        return True
+    if value in ("0", "false", "no", "nao", "não", "off"):
+        return False
+    return default
+
+
+def parse_int_list_env(name: str) -> list[int]:
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return []
+
+    ids = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            ids.append(int(item))
+        except ValueError:
+            logging.warning(f"ID inválido em {name}: {item!r}")
+
+    return ids
+
+
+# ==============================
+# Variáveis principais
+# ==============================
+API_ID = get_int_env("API_ID", 0)
+API_HASH = (os.getenv("API_HASH", "") or "").strip()
+STRING_SESSION = (os.getenv("STRING_SESSION", "") or "").strip()
+
+# Novo: permite vários grupos/canais de origem
+ORIGEM_CHAT_IDS = parse_int_list_env("ORIGEM_CHAT_IDS")
+
+# Compatibilidade com a variável antiga
+ORIGEM_CHAT_ID = get_int_env("ORIGEM_CHAT_ID", 0)
+if ORIGEM_CHAT_ID and ORIGEM_CHAT_ID not in ORIGEM_CHAT_IDS:
+    ORIGEM_CHAT_IDS.append(ORIGEM_CHAT_ID)
+
+# Username antigo como fallback opcional
+ORIGEM_USERNAME = (os.getenv("ORIGEM_USERNAME", "") or "").strip().lower()
+if ORIGEM_USERNAME.startswith("@"):
+    ORIGEM_USERNAME = ORIGEM_USERNAME[1:]
+
+DESTINO_CHAT_ID = get_int_env("DESTINO_CHAT_ID", 0)
+
+MODE = (os.getenv("MODE", "copy") or "copy").strip().lower()
+REPLACE_FROM = (os.getenv("REPLACE_FROM", "") or "").strip()
+REPLACE_TO = (os.getenv("REPLACE_TO", "") or "").strip()
+
+NOTIFY_CHAT_ID = get_int_env("NOTIFY_CHAT_ID", 0)
+DEBUG = get_bool_env("DEBUG", False)
+
+# Novo: só filtra remetente bot quando você ativar
+REQUIRE_SENDER_BOT = get_bool_env("REQUIRE_SENDER_BOT", False)
+
+SESSION_NAME = "forwarder"
+
+
+# ==============================
+# Logging
+# ==============================
+os.makedirs("logs", exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("logs/forwarder.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+
+
+# ==============================
+# Healthcheck HTTP para Render
+# ==============================
 class HealthHandler(BaseHTTPRequestHandler):
     def _ok(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
+
     def do_GET(self):
         if self.path in ("/", "/health"):
             self._ok()
             self.wfile.write(b"OK")
         else:
             self.send_error(404)
+
     def do_HEAD(self):
         if self.path in ("/", "/health"):
             self._ok()
         else:
             self.send_error(404)
+
     def log_message(self, *args, **kwargs):
         return
+
 
 def start_health_server(port: int):
     logging.info(f"HTTP health em 0.0.0.0:{port}")
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
-# ------------------------------------
 
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-
-# >>> NOVO: origem por ID (prioritário) e DEBUG opcional <<<
-ORIGEM_CHAT_ID = int(os.getenv("ORIGEM_CHAT_ID", "0"))  # ex.: 779230055 (DM @cornerpro2_bot) ou -100... (canal/grupo)
-DEBUG = os.getenv("DEBUG", "0") == "1"
-
-SOURCE_BOT = os.getenv("ORIGEM_USERNAME", "") or ""
-TARGET_CHAT_ID = int(os.getenv("DESTINO_CHAT_ID", "0"))
-MODE = os.getenv("MODE", "copy").strip().lower()   # forward ou copy
-STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
-REPLACE_FROM = (os.getenv("REPLACE_FROM", "") or "").strip()
-REPLACE_TO = (os.getenv("REPLACE_TO", "") or "").strip()
-NOTIFY_CHAT_ID = int(os.getenv("NOTIFY_CHAT_ID", "0"))  # <= NOVO
-
-# Normalizar username (sem @)
-if SOURCE_BOT.startswith("@"):
-    SOURCE_BOT = SOURCE_BOT[1:]
-SOURCE_BOT = SOURCE_BOT.lower()
-
-SESSION_NAME = "forwarder"
 
 # ==============================
-# Logging
-# ==============================
-os.makedirs("logs", exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("logs/forwarder.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ],
-)
-
-# ==============================
-# Inicializar cliente
+# Inicializar cliente Telegram
 # ==============================
 if STRING_SESSION:
     client = TelegramClient(
-        StringSession(STRING_SESSION), API_ID, API_HASH,
-        device_model="CornerForward", system_version="Windows 11", app_version="1.40.0"
+        StringSession(STRING_SESSION),
+        API_ID,
+        API_HASH,
+        device_model="BrotherBot",
+        system_version="Windows 11",
+        app_version="1.40.0",
     )
 else:
     client = TelegramClient(
-        SESSION_NAME, API_ID, API_HASH,
-        device_model="CornerForward", system_version="Windows 11", app_version="1.40.0"
+        SESSION_NAME,
+        API_ID,
+        API_HASH,
+        device_model="BrotherBot",
+        system_version="Windows 11",
+        app_version="1.40.0",
     )
 
+
 # ==============================
-# Helpers de substituição
+# Substituição de texto
 # ==============================
 def _build_replace_patterns() -> list:
     patterns = []
+
     if not REPLACE_FROM:
         return patterns
 
@@ -105,50 +175,61 @@ def _build_replace_patterns() -> list:
     except re.error:
         pass
 
-    m = re.search(r'([a-z0-9.-]+\.[a-z]{2,})', REPLACE_FROM, re.I)
-    if m:
-        host = re.escape(m.group(1))
-        wide = re.compile(rf'(?:https?://)?(?:www\.)?{host}\S*', flags=re.IGNORECASE)
+    match = re.search(r"([a-z0-9.-]+\.[a-z]{2,})", REPLACE_FROM, re.I)
+    if match:
+        host = re.escape(match.group(1))
+        wide = re.compile(rf"(?:https?://)?(?:www\.)?{host}\S*", flags=re.IGNORECASE)
         patterns.append(wide)
 
     return patterns
 
+
 _REPLACE_PATTERNS = _build_replace_patterns()
+
 
 def replace_text(text: str) -> str:
     if not text:
         return ""
+
     if not REPLACE_TO or not _REPLACE_PATTERNS:
         return text
 
     new_text = text
     total_hits = 0
-    for pat in _REPLACE_PATTERNS:
-        new_text, hits = pat.subn(REPLACE_TO, new_text)
+
+    for pattern in _REPLACE_PATTERNS:
+        new_text, hits = pattern.subn(REPLACE_TO, new_text)
         total_hits += hits
 
     if total_hits > 0:
-        logging.info(f"Substituição aplicada ({total_hits} ocorrência(s)).")
-    else:
+        logging.info(f"Substituição aplicada: {total_hits} ocorrência(s).")
+    elif DEBUG:
         logging.info("Nenhuma ocorrência encontrada para substituição.")
 
     return new_text
 
-# ==============================
-# Envio + notificação
-# ==============================
-async def _notify_if_configured(preview_text: str):
-    """Envia alerta pra você após publicar no canal, se NOTIFY_CHAT_ID estiver setado."""
-    if NOTIFY_CHAT_ID == 0:
-        return
-    try:
-        msg = f"✅ Encaminhado para {TARGET_CHAT_ID}\nPrévia: {preview_text[:200]}"
-        await client.send_message(NOTIFY_CHAT_ID, msg, silent=False, link_preview=False)
-    except Exception as e:
-        logging.warning(f"Falha ao notificar NOTIFY_CHAT_ID: {e}")
 
 # ==============================
-# Funções de cópia e forward
+# Notificação opcional
+# ==============================
+async def _notify_if_configured(preview_text: str):
+    if NOTIFY_CHAT_ID == 0:
+        return
+
+    try:
+        msg = f"✅ Encaminhado para {DESTINO_CHAT_ID}\nPrévia: {preview_text[:200]}"
+        await client.send_message(
+            NOTIFY_CHAT_ID,
+            msg,
+            silent=False,
+            link_preview=False,
+        )
+    except Exception as error:
+        logging.warning(f"Falha ao notificar NOTIFY_CHAT_ID: {error}")
+
+
+# ==============================
+# Envio
 # ==============================
 async def _copy_single_message(msg):
     text = msg.message or ""
@@ -156,49 +237,61 @@ async def _copy_single_message(msg):
 
     if msg.media:
         await client.send_file(
-            TARGET_CHAT_ID,
+            DESTINO_CHAT_ID,
             msg.media,
             caption=new_text,
             force_document=False,
-            silent=False
+            silent=False,
         )
     else:
         await client.send_message(
-            TARGET_CHAT_ID,
+            DESTINO_CHAT_ID,
             new_text or "",
             link_preview=True,
-            silent=False
+            silent=False,
         )
 
+
 async def _handle_copy(event):
+    # Álbuns com várias mídias
     if getattr(event, "messages", None):
         files = []
         caption = None
-        for m in event.messages:
-            if m.media:
-                files.append(m.media)
-            if not caption and (m.message or "").strip():
-                caption = replace_text(m.message)
+
+        for message in event.messages:
+            if message.media:
+                files.append(message.media)
+
+            if not caption and (message.message or "").strip():
+                caption = replace_text(message.message)
+
         if files:
             await client.send_file(
-                TARGET_CHAT_ID,
+                DESTINO_CHAT_ID,
                 files,
                 caption=caption or None,
-                silent=False
+                silent=False,
             )
+
         return
+
     await _copy_single_message(event.message)
 
+
 async def _handle_forward(event):
+    # Se tiver substituição ativa, precisa copiar em vez de encaminhar
     if REPLACE_FROM:
-        logging.info("Substituição ativa: usando COPY em vez de FORWARD")
+        logging.info("Substituição ativa: usando COPY em vez de FORWARD.")
         await _handle_copy(event)
         return
-    await event.forward_to(TARGET_CHAT_ID)
+
+    await event.forward_to(DESTINO_CHAT_ID)
+
 
 async def _process_event(event):
     try:
         effective_mode = MODE
+
         if MODE == "forward" and REPLACE_FROM:
             effective_mode = "copy"
 
@@ -207,51 +300,86 @@ async def _process_event(event):
         else:
             await _handle_forward(event)
 
-        preview = (event.raw_text or "").replace("\n", " ")[:120]
-        logging.info(f"Enviado → {TARGET_CHAT_ID} | Mode={effective_mode} | Preview='{preview}'")
+        preview = (getattr(event, "raw_text", "") or "").replace("\n", " ")[:120]
 
-        # ===== NOVO: notifica você após publicar =====
+        logging.info(
+            f"Enviado → {DESTINO_CHAT_ID} | "
+            f"Origem={getattr(event, 'chat_id', None)} | "
+            f"Mode={effective_mode} | "
+            f"Preview={preview!r}"
+        )
+
         await _notify_if_configured(preview)
 
-    except FloodWaitError as fw:
-        wait = getattr(fw, "seconds", 5)
-        logging.warning(f"FloodWait: aguardando {wait}s")
+    except FloodWaitError as flood:
+        wait = getattr(flood, "seconds", 5)
+        logging.warning(f"FloodWait: aguardando {wait}s.")
         await asyncio.sleep(wait + 1)
-    except Exception as e:
-        logging.exception(f"Erro ao enviar: {e}")
+
+    except Exception as error:
+        logging.exception(f"Erro ao enviar: {error}")
+
 
 # ==============================
-# Filtro de origem (PRIORIDADE: ID do chat)
+# Filtro de origem
 # ==============================
 async def _is_from_source(event) -> bool:
-    # 1) Preferir ID do chat (mais robusto; cobre DM/canal/grupo)
-    try:
-        if ORIGEM_CHAT_ID and event.chat_id == ORIGEM_CHAT_ID:
-            if DEBUG:
-                logging.info(f"[DEBUG] match por ID da origem: {event.chat_id}")
-            return True
-    except Exception:
-        pass
+    chat_id = getattr(event, "chat_id", None)
 
-    # 2) Fallback por username (caso ainda use ORIGEM_USERNAME)
-    sender_user = ""
-    chat_user = ""
+    sender_username = ""
+    chat_username = ""
+
     try:
         sender = await event.get_sender()
-        sender_user = (getattr(sender, "username", "") or "").lower()
+        sender_username = (getattr(sender, "username", "") or "").lower()
     except Exception:
         pass
 
     try:
         chat = await event.get_chat()
-        chat_user = (getattr(chat, "username", "") or "").lower()
+        chat_username = (getattr(chat, "username", "") or "").lower()
     except Exception:
         pass
 
     if DEBUG:
-        logging.info(f"[DEBUG] chat_id={getattr(event, 'chat_id', None)} sender={sender_user!r} chat={chat_user!r} want={SOURCE_BOT!r}")
+        logging.info(
+            f"[DEBUG] chat_id={chat_id} | "
+            f"sender={sender_username!r} | "
+            f"chat={chat_username!r} | "
+            f"origens_ids={ORIGEM_CHAT_IDS} | "
+            f"origem_username={ORIGEM_USERNAME!r}"
+        )
 
-    return (SOURCE_BOT and (sender_user == SOURCE_BOT or chat_user == SOURCE_BOT))
+    # Prioridade: IDs dos grupos/canais
+    if ORIGEM_CHAT_IDS and chat_id in ORIGEM_CHAT_IDS:
+        return True
+
+    # Fallback opcional: username
+    if ORIGEM_USERNAME and (
+        sender_username == ORIGEM_USERNAME or chat_username == ORIGEM_USERNAME
+    ):
+        return True
+
+    return False
+
+
+async def _sender_passes_bot_filter(event) -> bool:
+    if not REQUIRE_SENDER_BOT:
+        return True
+
+    try:
+        sender = await event.get_sender()
+        is_bot = bool(getattr(sender, "bot", False))
+
+        if DEBUG:
+            logging.info(f"[DEBUG] REQUIRE_SENDER_BOT ativo. sender.bot={is_bot}")
+
+        return is_bot
+
+    except Exception as error:
+        logging.warning(f"Não consegui verificar se remetente é bot: {error}")
+        return False
+
 
 # ==============================
 # Handlers
@@ -261,32 +389,24 @@ async def on_new_message(event):
     if not await _is_from_source(event):
         return
 
-    # 🔴 NOVO FILTRO: só processa se quem enviou for BOT
-    try:
-        sender = await event.get_sender()
-        if not getattr(sender, "bot", False):
-            return
-    except Exception:
+    if not await _sender_passes_bot_filter(event):
         return
 
     await _process_event(event)
 
 
 if hasattr(events, "Album"):
+
     @client.on(events.Album)
     async def on_album(event):
         if not await _is_from_source(event):
             return
 
-        # 🔴 NOVO FILTRO: só processa se quem enviou for BOT
-        try:
-            sender = await event.get_sender()
-            if not getattr(sender, "bot", False):
-                return
-        except Exception:
+        if not await _sender_passes_bot_filter(event):
             return
 
         await _process_event(event)
+
 
 # ==============================
 # Main
@@ -294,13 +414,36 @@ if hasattr(events, "Album"):
 def main():
     logging.info("Forwarder rodando…")
 
-    # (C) --- Inicia o health server (NOVO) ---
-    port = int(os.getenv("PORT", "10000"))
+    if not API_ID:
+        logging.warning("API_ID não configurado.")
+
+    if not API_HASH:
+        logging.warning("API_HASH não configurado.")
+
+    if not STRING_SESSION:
+        logging.warning("STRING_SESSION não configurado. No Render, normalmente precisa dele.")
+
+    if not DESTINO_CHAT_ID:
+        logging.warning("DESTINO_CHAT_ID não configurado.")
+
+    if not ORIGEM_CHAT_IDS and not ORIGEM_USERNAME:
+        logging.warning(
+            "Nenhuma origem configurada. Configure ORIGEM_CHAT_IDS ou ORIGEM_USERNAME."
+        )
+
+    logging.info(f"Origens por ID: {ORIGEM_CHAT_IDS}")
+    logging.info(f"Origem por username: {ORIGEM_USERNAME or '(vazio)'}")
+    logging.info(f"Destino: {DESTINO_CHAT_ID}")
+    logging.info(f"Mode: {MODE}")
+    logging.info(f"Require sender bot: {REQUIRE_SENDER_BOT}")
+    logging.info(f"Debug: {DEBUG}")
+
+    port = get_int_env("PORT", 10000)
     threading.Thread(target=start_health_server, args=(port,), daemon=True).start()
-    # -----------------------------------------
 
     client.start()
     client.run_until_disconnected()
+
 
 if __name__ == "__main__":
     main()
