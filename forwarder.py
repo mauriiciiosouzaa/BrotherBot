@@ -83,6 +83,10 @@ MODE = (os.getenv("MODE", "copy") or "copy").strip().lower()
 REPLACE_FROM = (os.getenv("REPLACE_FROM", "") or "").strip()
 REPLACE_TO = (os.getenv("REPLACE_TO", "") or "").strip()
 
+AUTHOR_LABEL = (os.getenv("AUTHOR_LABEL", "Brother Bot") or "Brother Bot").strip()
+CTA_TEXT = (os.getenv("CTA_TEXT", "Entrem no nosso outro canal grátis! 📲 https://t.me/BrotherDosGreens") or "").strip()
+OVER_GOL_RULE = (os.getenv("OVER_GOL_RULE", "buscar uma ODD mínima de 1.70") or "").strip()
+
 NOTIFY_CHAT_ID = get_int_env("NOTIFY_CHAT_ID", 0)
 DEBUG = get_bool_env("DEBUG", False)
 
@@ -162,7 +166,7 @@ else:
 
 
 # ==============================
-# Substituição de texto
+# Substituição / edição de texto
 # ==============================
 def _build_replace_patterns() -> list:
     patterns = []
@@ -187,28 +191,152 @@ def _build_replace_patterns() -> list:
 _REPLACE_PATTERNS = _build_replace_patterns()
 
 
-def replace_text(text: str) -> str:
-    if not text:
-        return ""
-
-    if not REPLACE_TO or not _REPLACE_PATTERNS:
-        return text
+def _apply_generic_replacements(text: str) -> str:
+    """
+    Mantém a substituição antiga REPLACE_FROM -> REPLACE_TO,
+    caso você ainda queira esconder algum domínio/nome específico.
+    """
+    if not text or not REPLACE_TO or not _REPLACE_PATTERNS:
+        return text or ""
 
     new_text = text
-    total_hits = 0
 
+    total_hits = 0
     for pattern in _REPLACE_PATTERNS:
         new_text, hits = pattern.subn(REPLACE_TO, new_text)
         total_hits += hits
 
     if total_hits > 0:
-        logging.info(f"Substituição aplicada: {total_hits} ocorrência(s).")
-    elif DEBUG:
-        logging.info("Nenhuma ocorrência encontrada para substituição.")
+        logging.info(f"Substituição genérica aplicada: {total_hits} ocorrência(s).")
 
     return new_text
 
 
+def _remove_extra_source_links(text: str) -> str:
+    """
+    Remove links da origem que você não quer divulgar no seu grupo.
+    Por enquanto remove tevosoares.com.br.
+    """
+    lines = []
+
+    for line in (text or "").splitlines():
+        if re.search(r"https?://(?:www\.)?tevosoares\.com\.br\S*", line, re.I):
+            continue
+
+        lines.append(line.rstrip())
+
+    return "\n".join(lines).strip()
+
+
+def _finish_with_cta(text: str) -> str:
+    """
+    Adiciona o convite do seu canal no final, evitando duplicar.
+    """
+    text = (text or "").strip()
+
+    if CTA_TEXT and CTA_TEXT not in text:
+        text = f"{text}\n{CTA_TEXT}"
+
+    return text.strip()
+
+
+def _clean_instruction(instruction: str) -> str:
+    """
+    Limpa a instrução do Tevo Soares.
+    Exemplo:
+    'entrar...; abortar...; se aluno(a)...'
+    vira:
+    'entrar...; abortar....'
+    """
+    instruction = (instruction or "").strip()
+
+    instruction = re.sub(
+        r";\s*se\s+aluno\(a\).*",
+        ".",
+        instruction,
+        flags=re.I | re.S,
+    ).strip()
+
+    instruction = re.sub(r"\s+", " ", instruction).strip()
+
+    if instruction and instruction[-1] not in ".!?":
+        instruction += "."
+
+    return instruction
+
+
+def _transform_tevo_alert(text: str) -> str | None:
+    """
+    Tipo padrão 1:
+    Troca '➡ Tevo Soares:' por '➡ Brother Bot:',
+    remove curso/método e remove link tevosoares.com.br.
+    """
+    pattern = re.compile(
+        r"➡\s*Tevo\s+Soares\s*:\s*(.*?)(?:\n\s*https?://(?:www\.)?tevosoares\.com\.br\S*)?\s*$",
+        flags=re.I | re.S,
+    )
+
+    match = pattern.search(text)
+
+    if not match:
+        return None
+
+    instruction = _clean_instruction(match.group(1))
+
+    base = pattern.sub("", text).strip()
+    base = _remove_extra_source_links(base)
+
+    return _finish_with_cta(
+        f"{base}\n\n➡ {AUTHOR_LABEL}:  {instruction}"
+    )
+
+
+def _transform_over_gol_alert(text: str) -> str | None:
+    """
+    Tipo padrão 2:
+    Quando for Over Gol e não tiver instrução, adiciona a regra padrão.
+    """
+    if not re.search(r"Oportunidade\s+para:\s*Over\s+Gol\b", text, flags=re.I):
+        return None
+
+    # Evita duplicar caso a mensagem já tenha sido editada antes
+    if re.search(rf"➡\s*{re.escape(AUTHOR_LABEL)}\s*:", text, flags=re.I):
+        return text
+
+    base = _remove_extra_source_links(text)
+
+    return _finish_with_cta(
+        f"{base}\n➡ {AUTHOR_LABEL}:  {OVER_GOL_RULE}"
+    )
+
+
+def replace_text(text: str) -> str:
+    """
+    Função principal chamada antes de enviar para o grupo destino.
+    """
+    if not text:
+        return ""
+
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    # Primeiro aplica substituição genérica antiga, se existir
+    text = _apply_generic_replacements(text)
+
+    # Depois tenta transformar alerta com Tevo Soares
+    transformed = _transform_tevo_alert(text)
+    if transformed:
+        logging.info("Mensagem editada pelo padrão: Tevo Soares → Brother Bot.")
+        return transformed
+
+    # Depois tenta transformar alerta Over Gol
+    transformed = _transform_over_gol_alert(text)
+    if transformed:
+        logging.info("Mensagem editada pelo padrão: Over Gol.")
+        return transformed
+
+    # Se não bater em nenhum padrão, envia como veio
+    return text
+    
 # ==============================
 # Notificação opcional
 # ==============================
