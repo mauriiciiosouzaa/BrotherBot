@@ -24,7 +24,7 @@ try:
     return int(value)
 except ValueError:
     logging.warning(
-        "Variável %s inválida: %r. Usando %s.",
+        "Variavel %s invalida: %r. Usando %s.",
         name,
         value,
         default,
@@ -63,7 +63,7 @@ for item in raw.split(","):
     try:
         values.append(int(item))
     except ValueError:
-        logging.warning("ID inválido em %s: %r", name, item)
+        logging.warning("ID invalido em %s: %r", name, item)
 
 return values
 ```
@@ -91,7 +91,6 @@ DESTINO_CHAT_ID = get_int_env("DESTINO_CHAT_ID")
 MODE = (os.getenv("MODE", "copy") or "copy").strip().lower()
 
 if MODE not in ("copy", "forward"):
-logging.warning("MODE inválido: %r. Usando copy.", MODE)
 MODE = "copy"
 
 REPLACE_FROM = (os.getenv("REPLACE_FROM", "") or "").strip()
@@ -104,13 +103,13 @@ os.getenv("AUTHOR_LABEL", "Brother Bot") or "Brother Bot"
 CTA_TEXT = (
 os.getenv(
 "CTA_TEXT",
-"Entrem no nosso outro canal grátis! 📲 https://t.me/BrotherDosGreens",
+"Entrem no nosso outro canal gratis! https://t.me/BrotherDosGreens",
 )
 or ""
 ).strip()
 
 OVER_GOL_RULE = (
-os.getenv("OVER_GOL_RULE", "buscar uma ODD mínima de 1.70") or ""
+os.getenv("OVER_GOL_RULE", "buscar uma ODD minima de 1.70") or ""
 ).strip()
 
 NOTIFY_CHAT_ID = get_int_env("NOTIFY_CHAT_ID")
@@ -189,14 +188,14 @@ patterns = [
     )
 ]
 
-domain = re.search(
+domain_match = re.search(
     r"([a-z0-9.-]+\.[a-z]{2,})",
     REPLACE_FROM,
-    re.IGNORECASE,
+    flags=re.IGNORECASE,
 )
 
-if domain:
-    host = re.escape(domain.group(1))
+if domain_match:
+    host = re.escape(domain_match.group(1))
 
     patterns.append(
         re.compile(
@@ -216,23 +215,20 @@ return text or ""
 
 ```
 result = text
-hits_total = 0
+total_hits = 0
 
 for pattern in REPLACE_PATTERNS:
     result, hits = pattern.subn(REPLACE_TO, result)
-    hits_total += hits
+    total_hits += hits
 
-if hits_total:
-    logging.info(
-        "Substituição genérica aplicada: %s ocorrência(s).",
-        hits_total,
-    )
+if total_hits:
+    logging.info("Substituicao generica aplicada: %s.", total_hits)
 
 return result
 ```
 
 def remove_source_links(text):
-kept = []
+lines = []
 
 ```
 for line in (text or "").splitlines():
@@ -243,9 +239,9 @@ for line in (text or "").splitlines():
     ):
         continue
 
-    kept.append(line.rstrip())
+    lines.append(line.rstrip())
 
-return "\n".join(kept).strip()
+return "\n".join(lines).strip()
 ```
 
 def finish_with_cta(text):
@@ -332,26 +328,26 @@ result = apply_generic_replacements(result)
 transformed = transform_tevo_alert(result)
 
 if transformed:
-    logging.info(
-        "Mensagem editada pelo padrão: Tevo Soares para Brother Bot."
-    )
+    logging.info("Mensagem editada: Tevo Soares para Brother Bot.")
     return transformed
 
 transformed = transform_over_gol_alert(result)
 
 if transformed:
-    logging.info("Mensagem editada pelo padrão: Over Gol.")
+    logging.info("Mensagem editada: Over Gol.")
     return transformed
 
 return result
 ```
 
 def has_uploadable_media(message):
-if not getattr(message, "media", None):
-return False
+media = getattr(message, "media", None)
 
 ```
-return not isinstance(message.media, MessageMediaWebPage)
+if not media:
+    return False
+
+return not isinstance(media, MessageMediaWebPage)
 ```
 
 async def list_chats():
@@ -372,7 +368,6 @@ try:
             bool(getattr(dialog, "is_channel", False)),
             type(entity).__name__,
         )
-
 except Exception as error:
     logging.exception("Erro ao listar chats: %s", error)
 
@@ -387,24 +382,23 @@ return
 try:
     await client.send_message(
         NOTIFY_CHAT_ID,
-        f"Encaminhado para {DESTINO_CHAT_ID}\nPrévia: {preview[:200]}",
+        f"Encaminhado para {DESTINO_CHAT_ID}\nPrevia: {preview[:200]}",
         silent=False,
         link_preview=False,
     )
-
 except Exception as error:
     logging.warning("Falha ao notificar: %s", error)
 ```
 
 async def copy_single_message(message):
-new_text = replace_text(message.message or "") or None
+text = replace_text(message.message or "")
 
 ```
 if has_uploadable_media(message):
     await client.send_file(
         DESTINO_CHAT_ID,
         message.media,
-        caption=new_text,
+        caption=text or None,
         force_document=False,
         silent=False,
     )
@@ -412,7 +406,7 @@ if has_uploadable_media(message):
 
 await client.send_message(
     DESTINO_CHAT_ID,
-    new_text or "",
+    text or "",
     link_preview=True,
     silent=False,
 )
@@ -492,11 +486,7 @@ effective_mode = MODE
 except FloodWaitError as flood:
     seconds = getattr(flood, "seconds", 5)
 
-    logging.warning(
-        "FloodWait: aguardando %ss.",
-        seconds,
-    )
-
+    logging.warning("FloodWait: aguardando %ss.", seconds)
     await asyncio.sleep(seconds + 1)
 
 except Exception as error:
@@ -563,12 +553,8 @@ try:
         )
 
     return is_bot
-
 except Exception as error:
-    logging.warning(
-        "Não consegui verificar o remetente: %s",
-        error,
-    )
+    logging.warning("Nao consegui verificar o remetente: %s", error)
     return False
 ```
 
@@ -604,10 +590,7 @@ async def on_album(event):
 def main():
 logging.info("Forwarder rodando.")
 logging.info("Origens por ID: %s", ORIGEM_CHAT_IDS)
-logging.info(
-"Origem por username: %s",
-ORIGEM_USERNAME or "(vazio)",
-)
+logging.info("Origem por username: %s", ORIGEM_USERNAME or "(vazio)")
 logging.info("Destino: %s", DESTINO_CHAT_ID)
 logging.info("Mode: %s", MODE)
 logging.info("Debug: %s", DEBUG)
@@ -615,16 +598,16 @@ logging.info("Listar chats: %s", LISTAR_CHATS)
 
 ```
 if not API_ID:
-    logging.warning("API_ID não configurado.")
+    logging.warning("API_ID nao configurado.")
 
 if not API_HASH:
-    logging.warning("API_HASH não configurado.")
+    logging.warning("API_HASH nao configurado.")
 
 if not STRING_SESSION:
-    logging.warning("STRING_SESSION não configurado.")
+    logging.warning("STRING_SESSION nao configurado.")
 
 if not DESTINO_CHAT_ID:
-    logging.warning("DESTINO_CHAT_ID não configurado.")
+    logging.warning("DESTINO_CHAT_ID nao configurado.")
 
 if not ORIGEM_CHAT_IDS and not ORIGEM_USERNAME:
     logging.warning("Nenhuma origem configurada.")
@@ -633,7 +616,6 @@ thread = threading.Thread(
     target=start_health_server,
     daemon=True,
 )
-
 thread.start()
 
 client.start()
